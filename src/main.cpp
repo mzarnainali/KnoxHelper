@@ -1,8 +1,17 @@
-#define DEBUG_UART 1
+#define DEBUG_UART 0
 
 //(NAKss
 
 #include <Arduino.h>
+#include "esp_task_wdt.h"
+#include "esp_int_wdt.h"
+#include "soc/rtc_wdt.h"
+#include "soc/rtc.h"
+#include "esp_system.h"
+
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+
 #include <stdarg.h>
 #include <WiFi.h>
 #include <ArduinoOTA.h>
@@ -157,6 +166,28 @@ bool changed_float(float a, float b, float eps = 0.01)
   return fabs(a - b) > eps;
 }
 
+#define TIMEOUT_SEC 300  // 5min
+#define APB_CLK 80000000 // 80 MHz default APB clock
+
+void setupWatchDog()
+{
+  // --- TASK WDT ---
+  esp_task_wdt_init(TIMEOUT_SEC, true); // Panic on timeout = true
+  esp_task_wdt_add(NULL);               // Add current task (loopTask)
+  /*
+    // --- RTC WDT ---
+    rtc_wdt_protect_off();
+    rtc_wdt_disable();
+
+    rtc_wdt_set_stage(RTC_WDT_STAGE0, RTC_WDT_STAGE_ACTION_RESET_SYSTEM);
+    // rtc_wdt_set_time(RTC_WDT_STAGE0, TIMEOUT_SEC * APB_CLK); // 30 seconds
+    rtc_wdt_set_time(RTC_WDT_STAGE0, (uint64_t)TIMEOUT_SEC * (uint64_t)APB_CLK); // 30 seconds
+
+    rtc_wdt_enable();
+    rtc_wdt_protect_on();
+    */
+}
+
 void get_inverter_json(char *json, size_t len)
 {
 
@@ -282,6 +313,102 @@ void logPrintf(bool newLine, const char *fmt, ...)
     telnetClient.print("\r\n");
 }
 
+void print_task_info()
+{
+
+  telnetClient.println("==============================================================");
+}
+
+void handle_telnet_commands()
+{
+  static char cmd_buffer[64];
+  static uint8_t index = 0;
+
+  if (!telnetClient || !telnetClient.connected())
+    return;
+
+  while (telnetClient.available())
+  {
+    char c = telnetClient.read();
+
+    // End of command
+    if (c == '\n' || c == '\r')
+    {
+      cmd_buffer[index] = '\0';
+      if (strcmp(cmd_buffer, "reboot") == 0)
+      {
+        telnetClient.println("Rebooting...");
+        delay(1000);
+
+        ESP.restart();
+      }
+      else if (strcmp(cmd_buffer, "heap") == 0)
+      {
+        uint32_t free_heap = ESP.getFreeHeap();
+        uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        uint32_t internal_free = heap_caps_get_free_size(MALLOC_CAP_INTERNAL);
+        uint32_t psram_free = heap_caps_get_free_size(MALLOC_CAP_SPIRAM);
+
+        float frag_index = 0;
+        if (free_heap > 0)
+          frag_index = 1.0 - ((float)largest_block / free_heap);
+
+        telnetClient.println("\n==== ESP32 HEAP STATUS ====");
+
+        telnetClient.printf("Free Heap        : %u bytes\n\r", free_heap);
+        telnetClient.printf("Largest Block    : %u bytes\n\r", largest_block);
+        telnetClient.printf("Internal Free    : %u bytes\n\r", internal_free);
+        telnetClient.printf("PSRAM Free       : %u bytes\n\r", psram_free);
+
+        telnetClient.printf("Fragmentation    : %.2f\n\r", frag_index);
+
+        telnetClient.println("----------------------------");
+
+        // Health status
+        if (largest_block < 8000)
+          telnetClient.println("STATUS: WARNING (High fragmentation)");
+        else if (largest_block < 20000)
+          telnetClient.println("STATUS: OK (Medium fragmentation)");
+        else
+          telnetClient.println("STATUS: GOOD (Healthy heap)");
+
+        telnetClient.println("============================\n\r");
+      }
+      else if (strcmp(cmd_buffer, "ping") == 0)
+      {
+        telnetClient.println("pong");
+      }
+      else if (strcmp(cmd_buffer, "tasks") == 0)
+      {
+        print_task_info();
+      }
+      else if (strcmp(cmd_buffer, "?") == 0 || strcmp(cmd_buffer, "help") == 0)
+      {
+        telnetClient.println("\n\r==== AVAILABLE COMMANDS ====");
+
+        telnetClient.println("tasks    - Show FreeRTOS tasks");
+        telnetClient.println("heap      - Detailed heap info");
+        telnetClient.println("reboot   - Restart ESP32");
+
+        telnetClient.println("============================\n\r");
+      }
+      else
+      {
+        telnetClient.println("Unknown command");
+      }
+
+      index = 0;
+    }
+    else
+    {
+      if (index < sizeof(cmd_buffer) - 1)
+      {
+        cmd_buffer[index++] = c;
+      }
+    }
+  }
+}
+
 const int CMD_COUNT = sizeof(cmdList) / sizeof(cmdList[0]);
 
 void sendCommand(const char *cmd)
@@ -289,7 +416,7 @@ void sendCommand(const char *cmd)
   invSerial.print(cmd);
   last_command_activity = millis();
   activeSource = SRC_ESP;
-  logPrint("sendCommand:" + String(cmd), true);
+  // logPrint("sendCommand:" + String(cmd), true);
 }
 
 void sendProtocolCommand()
@@ -423,7 +550,7 @@ void processGSX(String data, InverterData &d)
   // PV current
   d.pv1_i = (d.pv1_v > 0) ? (d.pv1_w / d.pv1_v) : 0;
 
-  logPrint("Watt:" + String(d.ac_w), true);
+  // logPrint("Watt:" + String(d.ac_w), true);
 }
 
 // =====================
@@ -462,7 +589,7 @@ void process_gs2b0(String data, InverterData &d)
   d.grid_power_w = grid_power_w;
   d.grid_power_kw = grid_power_kw;
 
-  logPrint("KWatt:" + String(d.grid_power_kw), true);
+  // logPrint("KWatt:" + String(d.grid_power_kw), true);
 }
 
 void process_mod(String data, InverterData &d)
@@ -493,7 +620,7 @@ void process_mod(String data, InverterData &d)
     d.inv_mode_s = String(enumWorkingMode[inv_mod]);
   }
 
-  logPrint("Mod:" + String(d.inv_mode_s), true);
+  // logPrint("Mod:" + String(d.inv_mode_s), true);
 }
 
 void processFrame(String data)
@@ -516,6 +643,49 @@ void processFrame(String data)
  {
    process_mod(data, inverterData);
  }*/
+}
+
+uint32_t last_heap_check = 0;
+uint32_t worst_largest_block = 999999;
+
+void check_heap_health()
+{
+  uint32_t now = millis();
+
+  // run every 5 seconds WITHOUT blocking
+  if (now - last_heap_check < 60000)
+    return;
+
+  last_heap_check = now;
+
+  uint32_t free_heap = ESP.getFreeHeap();
+  uint32_t largest_block = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+
+  // track worst case over time
+  if (largest_block < worst_largest_block)
+    worst_largest_block = largest_block;
+
+  if (telnetClient && telnetClient.connected())
+  {
+    telnetClient.printf("Heap: free=%u | largest=%u | worst=%u\n\r",
+                        free_heap,
+                        largest_block,
+                        worst_largest_block);
+  }
+
+  // immediate fragmentation check
+  if (largest_block < 8000)
+  {
+    // Serial.println("CRITICAL: heap fragmentation → reboot");
+    ESP.restart();
+  }
+
+  // long-term degradation check
+  if (worst_largest_block < 5000)
+  {
+    // Serial.println("CRITICAL: heap degraded over time → reboot");
+    ESP.restart();
+  }
 }
 
 String formatTime(time_t rawTime)
@@ -644,7 +814,7 @@ void setupWebServer()
             {
               reset_wifi_module();
               request->send_P(200, "text/html", P_DASH_BOARD); });
-  
+
   server.on("/rebootme", HTTP_GET, [](AsyncWebServerRequest *request)
             {
               esp_restart();
@@ -696,6 +866,24 @@ void IRAM_ATTR srv_isr()
   srv_changed = true;
 }
 
+int last_day = -1;
+
+void check_reboot_daily()
+{
+    timeClient.update();
+
+    int day = timeClient.getDay();  // changes every day
+
+    if (last_day == -1)
+        last_day = day;
+
+    if (day != last_day)
+    {
+        delay(1000);
+        ESP.restart();
+    }
+}
+
 // ----------------- SETUP -----------------
 void setup()
 {
@@ -714,6 +902,7 @@ void setup()
   timeClient.update();
 
   reset_wifi_module();
+  setupWatchDog();
 }
 
 void handleTelnet()
@@ -754,18 +943,23 @@ int last_server_status = -1;
 // ----------------- LOOP -----------------
 void loop()
 {
+  // Feed both watchdogs
+  esp_task_wdt_reset();
+
   // OTA handler (IMPORTANT)
   ArduinoOTA.handle();
 
   // Telnet client handler
   handleTelnet();
+  handle_telnet_commands();
+  check_heap_health();
   web_active = (millis() - last_web_activity) < 30000;
   if (millis() - lastCleanup > 5000)
   {
     ws.cleanupClients();
     lastCleanup = millis();
     timeClient.update();
-   
+    check_reboot_daily();
   }
 
   // ---------------- WIFI → INV ----------------
